@@ -160,8 +160,12 @@ jobs:
           set -euo pipefail
           APP="target/release/bundle/macos/Buzz.app"
           codesign --verify --deep --strict --verbose=2 "$APP"
-          codesign -dv "$APP" 2>&1 | grep -q "Developer ID Application: Beoflow B.V." \
+          # -dv prints TeamIdentifier but not Authority; Authority needs --verbose=4.
+          codesign -dv --verbose=4 "$APP" 2>&1 \
+            | grep -q "Authority=Developer ID Application: Beoflow B.V." \
             || { echo "::error::not signed with the Beoflow Developer ID"; exit 1; }
+          codesign -dv "$APP" 2>&1 | grep -q "TeamIdentifier=2D9Q24N9UQ" \
+            || { echo "::error::signed by the wrong team"; exit 1; }
           for bin in "$APP"/Contents/Resources/bin/*; do
             codesign --verify --strict --verbose=2 "$bin"
           done
