@@ -1,17 +1,22 @@
 name: Buzz 1.0 release
 
 # Build, sign, notarize and publish a macOS build of the Causeway fork of
-# block/buzz-app (Buzz 1.0). Modelled on the proven signing path in release.yml
-# (Tauri's own signing + notarization with the Beoflow Developer ID and an App
-# Store Connect API key), but it builds block/buzz-app instead of block/buzz.
+# block/buzz-app (Buzz 1.0).
 #
-# Deliberately macOS-only: the two machines that run this fork are both Apple
-# Silicon, and Windows/Linux would multiply CI cost for nobody.
+# macOS-only on purpose: the machines that run this fork are Apple Silicon, and
+# Windows/Linux targets would multiply CI cost for nobody.
 #
-# Deliberately without the Tauri updater: this fork updates itself through
-# ~/GitHub/buzz-app/sync.sh (git-based, daily launchd job), so no
-# TAURI_SIGNING_PRIVATE_KEY or updater feed is involved. Add it back if the fork
-# ever needs self-update on machines it does not control.
+# No Tauri updater: this fork updates itself through ~/GitHub/buzz-app/sync.sh
+# (git-based, daily launchd job), so no TAURI_SIGNING_PRIVATE_KEY or updater feed
+# is involved.
+#
+# Notarization is done by hand here rather than by Tauri, because Tauri signing
+# covers the .app but not the helper binaries that beforeBuildCommand stages into
+# Contents/Resources/bin (buzz, buzz-agent-command, goose-acp). Those are unsigned
+# by default, which fails notarization with "The binary is not signed with a valid
+# Developer ID certificate" and "does not have the hardened runtime enabled".
+# So: build signed-but-not-notarized, sign every nested binary, deep-sign the app,
+# then notarize and staple.
 #
 # Required secrets:
 #   BUZZ_APP_DEPLOY_KEY          read-only deploy key for ddfourtwo/buzz-app-fork
@@ -72,7 +77,7 @@ jobs:
     name: macOS (arm64)
     needs: [setup]
     runs-on: macos-latest
-    timeout-minutes: 120
+    timeout-minutes: 150
     permissions:
       contents: read
     outputs:
@@ -97,49 +102,77 @@ jobs:
       - name: Install JS dependencies
         run: pnpm install --frozen-lockfile
 
-      - name: Stage the notarization key
-        env:
-          APPLE_API_PRIVATE_KEY: ${{ secrets.APPLE_API_PRIVATE_KEY }}
-        run: |
-          set -euo pipefail
-          printf '%s\n' "$APPLE_API_PRIVATE_KEY" > "$RUNNER_TEMP/AuthKey.p8"
-          echo "APPLE_API_KEY_PATH=$RUNNER_TEMP/AuthKey.p8" >> "$GITHUB_ENV"
-
-      - name: Build, sign and notarize
+      - name: Build, signed but not notarized
         env:
           VERSION: ${{ needs.setup.outputs.version }}
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
-          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
-          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
         run: |
           set -euo pipefail
-          # --config sets the version upstream would inject from its release tag;
-          # buzz-app's own tauri.conf.json still declares 0.7.0.
-          pnpm tauri build --bundles app,dmg \
-            --config "{\"version\":\"$VERSION\"}"
+          # No APPLE_API_* here: that would make Tauri notarize a bundle whose
+          # nested helper binaries are still unsigned. --config sets the version
+          # upstream would inject from its release tag (tauri.conf.json says 0.7.0).
+          pnpm tauri build --bundles app --config "{\"version\":\"$VERSION\"}"
 
-      - name: Verify the signature and the notarization
+      - name: Sign every nested binary, then the app
+        run: |
+          set -euo pipefail
+          APP="target/release/bundle/macos/Buzz.app"
+          shopt -s nullglob
+          nested=("$APP"/Contents/Resources/bin/*)
+          [ "${#nested[@]}" -gt 0 ] || { echo "::error::no helper binaries found to sign"; exit 1; }
+          for bin in "${nested[@]}"; do
+            echo "signing $bin"
+            codesign --force --options runtime --timestamp \
+              --sign "$APPLE_SIGNING_IDENTITY" "$bin"
+          done
+          # Signing the helpers invalidates the app's seal, so the app is re-signed
+          # after them.
+          codesign --force --deep --options runtime --timestamp \
+            --sign "$APPLE_SIGNING_IDENTITY" "$APP"
+
+      - name: Verify the signature before notarizing
         run: |
           set -euo pipefail
           APP="target/release/bundle/macos/Buzz.app"
           codesign --verify --deep --strict --verbose=2 "$APP"
           codesign -dv "$APP" 2>&1 | grep -q "Developer ID Application: Beoflow B.V." \
             || { echo "::error::not signed with the Beoflow Developer ID"; exit 1; }
-          spctl --assess --type execute --verbose=2 "$APP" \
-            || { echo "::error::Gatekeeper rejects the app (not notarized?)"; exit 1; }
+          for bin in "$APP"/Contents/Resources/bin/*; do
+            codesign --verify --strict --verbose=2 "$bin"
+          done
           echo "version: $(defaults read "$PWD/$APP/Contents/Info" CFBundleShortVersionString)"
 
-      - name: Package the app for install
+      - name: Notarize and staple
+        env:
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_PRIVATE_KEY: ${{ secrets.APPLE_API_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          APP="target/release/bundle/macos/Buzz.app"
+          printf '%s\n' "$APPLE_API_PRIVATE_KEY" > "$RUNNER_TEMP/AuthKey.p8"
+          ditto -c -k --keepParent "$APP" "$RUNNER_TEMP/notarize.zip"
+          xcrun notarytool submit "$RUNNER_TEMP/notarize.zip" \
+            --key "$RUNNER_TEMP/AuthKey.p8" \
+            --key-id "$APPLE_API_KEY" \
+            --issuer "$APPLE_API_ISSUER" \
+            --wait
+          xcrun stapler staple "$APP"
+          spctl --assess --type execute --verbose=2 "$APP" \
+            || { echo "::error::Gatekeeper still rejects the app after stapling"; exit 1; }
+
+      - name: Package the app and a dmg
         run: |
           set -euo pipefail
           VERSION="${{ needs.setup.outputs.version }}"
+          APP="target/release/bundle/macos/Buzz.app"
           mkdir -p "$RUNNER_TEMP/out"
-          ditto -c -k --keepParent "target/release/bundle/macos/Buzz.app" \
+          ditto -c -k --keepParent "$APP" \
             "$RUNNER_TEMP/out/Buzz_${VERSION}_aarch64.app.zip"
-          DMG=$(find target/release/bundle/dmg -name '*.dmg' | head -1)
-          [ -n "$DMG" ] || { echo "::error::no dmg produced"; exit 1; }
-          cp "$DMG" "$RUNNER_TEMP/out/Buzz_${VERSION}_aarch64.dmg"
+          # Built from the stapled app, so the dmg carries the ticket too.
+          hdiutil create -quiet -volname "Buzz" -srcfolder "$APP" \
+            -ov -format UDZO "$RUNNER_TEMP/out/Buzz_${VERSION}_aarch64.dmg"
 
       - uses: actions/upload-artifact@v4
         with:
@@ -166,14 +199,15 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ needs.setup.outputs.version }}
           BASE_TAG: ${{ inputs.base_tag }}
+          SOURCE_SHA: ${{ needs.release-macos.outputs.sha }}
         run: |
           set -euo pipefail
           ls -l dist
           gh release create "v$VERSION" --repo "$GITHUB_REPOSITORY" \
             --title "Buzz $VERSION" \
-            --notes "Causeway fork of block/buzz-app (Buzz 1.0), $BASE_TAG + the causeway patch stack at ${{ github.ref_name }}.
+            --notes "Causeway fork of block/buzz-app (Buzz 1.0): $BASE_TAG plus the causeway patch stack, built from ${SOURCE_SHA}.
 
-          Built from \`${{ needs.release-macos.outputs.sha || 'the requested ref' }}\`. Signed with the Beoflow Developer ID and notarized. macOS arm64 only.
+          Signed with the Beoflow Developer ID, notarized and stapled. macOS arm64 only.
 
-          Installs to /Applications/Buzz 1.0.app; bundle id xyz.block.buzz.desktop, so it coexists with Buzz 0.X." \
+          Installs to /Applications/Buzz 1.0.app. The bundle id is xyz.block.buzz.desktop, so it coexists with Buzz 0.X (xyz.block.buzz.app)." \
             dist/*
