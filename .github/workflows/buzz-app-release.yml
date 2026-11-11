@@ -1,0 +1,179 @@
+name: Buzz 1.0 release
+
+# Build, sign, notarize and publish a macOS build of the Causeway fork of
+# block/buzz-app (Buzz 1.0). Modelled on the proven signing path in release.yml
+# (Tauri's own signing + notarization with the Beoflow Developer ID and an App
+# Store Connect API key), but it builds block/buzz-app instead of block/buzz.
+#
+# Deliberately macOS-only: the two machines that run this fork are both Apple
+# Silicon, and Windows/Linux would multiply CI cost for nobody.
+#
+# Deliberately without the Tauri updater: this fork updates itself through
+# ~/GitHub/buzz-app/sync.sh (git-based, daily launchd job), so no
+# TAURI_SIGNING_PRIVATE_KEY or updater feed is involved. Add it back if the fork
+# ever needs self-update on machines it does not control.
+#
+# Required secrets:
+#   BUZZ_APP_DEPLOY_KEY          read-only deploy key for ddfourtwo/buzz-app-fork
+#   APPLE_CERTIFICATE            Developer ID Application .p12, base64
+#   APPLE_CERTIFICATE_PASSWORD   its password
+#   APPLE_API_ISSUER             App Store Connect issuer UUID
+#   APPLE_API_KEY                App Store Connect key id
+#   APPLE_API_PRIVATE_KEY        App Store Connect AuthKey .p8 contents
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Branch or tag in ddfourtwo/buzz-app-fork to build
+        required: true
+        default: causeway
+      version:
+        description: Version to publish, e.g. 1.0.0-causeway.6
+        required: true
+      base_tag:
+        description: Upstream block/buzz-app tag the stack sits on, e.g. v1.0.0
+        required: false
+        default: v1.0.0
+
+permissions:
+  contents: read
+
+concurrency:
+  group: buzz-app-release
+  cancel-in-progress: false
+
+env:
+  APPLE_SIGNING_IDENTITY: "Developer ID Application: Beoflow B.V. (2D9Q24N9UQ)"
+
+jobs:
+  setup:
+    name: Validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      version: ${{ steps.check.outputs.version }}
+    steps:
+      - name: Validate version and that it is not already published
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          echo "$VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.]+)?$' \
+            || { echo "::error::version '$VERSION' is not semver"; exit 1; }
+          if gh release view "v$VERSION" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "::error::v$VERSION is already published"; exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+  release-macos:
+    name: macOS (arm64)
+    needs: [setup]
+    runs-on: macos-latest
+    timeout-minutes: 120
+    permissions:
+      contents: read
+    outputs:
+      sha: ${{ steps.src.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ddfourtwo/buzz-app-fork
+          ref: ${{ inputs.ref }}
+          ssh-key: ${{ secrets.BUZZ_APP_DEPLOY_KEY }}
+          fetch-depth: 0
+
+      - name: Record the source commit
+        id: src
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      # This repo carries its own pinned toolchain (node, pnpm, cargo).
+      - uses: cashapp/activate-hermit@v1
+        with:
+          cache: "true"
+
+      - name: Install JS dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Stage the notarization key
+        env:
+          APPLE_API_PRIVATE_KEY: ${{ secrets.APPLE_API_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          printf '%s\n' "$APPLE_API_PRIVATE_KEY" > "$RUNNER_TEMP/AuthKey.p8"
+          echo "APPLE_API_KEY_PATH=$RUNNER_TEMP/AuthKey.p8" >> "$GITHUB_ENV"
+
+      - name: Build, sign and notarize
+        env:
+          VERSION: ${{ needs.setup.outputs.version }}
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+        run: |
+          set -euo pipefail
+          # --config sets the version upstream would inject from its release tag;
+          # buzz-app's own tauri.conf.json still declares 0.7.0.
+          pnpm tauri build --bundles app,dmg \
+            --config "{\"version\":\"$VERSION\"}"
+
+      - name: Verify the signature and the notarization
+        run: |
+          set -euo pipefail
+          APP="target/release/bundle/macos/Buzz.app"
+          codesign --verify --deep --strict --verbose=2 "$APP"
+          codesign -dv "$APP" 2>&1 | grep -q "Developer ID Application: Beoflow B.V." \
+            || { echo "::error::not signed with the Beoflow Developer ID"; exit 1; }
+          spctl --assess --type execute --verbose=2 "$APP" \
+            || { echo "::error::Gatekeeper rejects the app (not notarized?)"; exit 1; }
+          echo "version: $(defaults read "$PWD/$APP/Contents/Info" CFBundleShortVersionString)"
+
+      - name: Package the app for install
+        run: |
+          set -euo pipefail
+          VERSION="${{ needs.setup.outputs.version }}"
+          mkdir -p "$RUNNER_TEMP/out"
+          ditto -c -k --keepParent "target/release/bundle/macos/Buzz.app" \
+            "$RUNNER_TEMP/out/Buzz_${VERSION}_aarch64.app.zip"
+          DMG=$(find target/release/bundle/dmg -name '*.dmg' | head -1)
+          [ -n "$DMG" ] || { echo "::error::no dmg produced"; exit 1; }
+          cp "$DMG" "$RUNNER_TEMP/out/Buzz_${VERSION}_aarch64.dmg"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-release
+          path: ${{ runner.temp }}/out/*
+          if-no-files-found: error
+          retention-days: 14
+
+  publish:
+    name: Publish
+    needs: [setup, release-macos]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: macos-release
+          path: dist
+
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.setup.outputs.version }}
+          BASE_TAG: ${{ inputs.base_tag }}
+        run: |
+          set -euo pipefail
+          ls -l dist
+          gh release create "v$VERSION" --repo "$GITHUB_REPOSITORY" \
+            --title "Buzz $VERSION" \
+            --notes "Causeway fork of block/buzz-app (Buzz 1.0), $BASE_TAG + the causeway patch stack at ${{ github.ref_name }}.
+
+          Built from \`${{ needs.release-macos.outputs.sha || 'the requested ref' }}\`. Signed with the Beoflow Developer ID and notarized. macOS arm64 only.
+
+          Installs to /Applications/Buzz 1.0.app; bundle id xyz.block.buzz.desktop, so it coexists with Buzz 0.X." \
+            dist/*
